@@ -1,126 +1,192 @@
+import { useEffect, useMemo, useState } from "react";
 import "./styles.css";
-
-const project = {
-  "sourceNo": 2,
-  "id": "hxyfront-62009",
-  "port": 62009,
-  "title": "地毯修复纹样档案",
-  "domain": "手工地毯修复",
-  "prompt": "做一个给手工地毯修复工作室使用的纹样与修复档案前端项目，可以记录地毯产地、年代、结密度、材质、染色类型、破损区域、补线颜色和修复工序。页面需要有纹样局部标记图、修复前后记录、材料色卡、工序进度和按产地筛选的档案列表。",
-  "palette": [
-    "#7c2d12",
-    "#b45309",
-    "#0f766e"
-  ],
-  "metrics": [
-    "待修复",
-    "纹样档案",
-    "色卡数量",
-    "完工率"
-  ],
-  "filters": [
-    "波斯",
-    "安纳托利亚",
-    "高加索",
-    "藏毯"
-  ],
-  "fields": [
-    "地毯产地",
-    "年代",
-    "结密度",
-    "材质",
-    "染色类型",
-    "破损区域"
-  ],
-  "records": [
-    [
-      "CAR-092",
-      "波斯",
-      "羊毛，约1960s",
-      "边缘磨损待补线"
-    ],
-    [
-      "CAR-117",
-      "安纳托利亚",
-      "植物染，结密度42",
-      "中心纹样缺口"
-    ],
-    [
-      "CAR-138",
-      "藏毯",
-      "局部褪色",
-      "需匹配靛蓝色卡"
-    ]
-  ]
-};
+import type { Carpet, CarpetDraft, DamageMark, RepairRecord } from "./model";
+import {
+  loadCarpets,
+  makeMark,
+  nextCarpetId,
+  saveCarpets,
+} from "./model";
+import {
+  addRecord,
+  filterByOrigin,
+  makeRecord,
+  removeRecord,
+  reopenMark,
+  signMark,
+  updateRecord,
+} from "./rules";
+import {
+  CarpetForm,
+  Detail,
+  Header,
+  MaterialPanel,
+  MetricsBar,
+  Sidebar,
+} from "./pages";
 
 function App() {
+  // 全部档案只存这一份 state，每次变更同步 localStorage —— 关掉再打开资料还在
+  const [carpets, setCarpets] = useState<Carpet[]>(loadCarpets);
+  const [origin, setOrigin] = useState("全部");
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedMarkId, setSelectedMarkId] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setSaveError(saveCarpets(carpets));
+  }, [carpets]);
+
+  // 默认选中第一块
+  useEffect(() => {
+    if (!selectedId && carpets.length > 0) setSelectedId(carpets[0].id);
+  }, [carpets, selectedId]);
+
+  // 按产地筛选 —— 列表、材料用量与进度都以这个口径同步更新
+  const visibleCarpets = useMemo(
+    () => filterByOrigin(carpets, origin),
+    [carpets, origin]
+  );
+  const selected =
+    carpets.find((c) => c.id === selectedId) ?? null;
+
+  /* ---------------- 通用：改某一块地毯 ---------------- */
+
+  const patchCarpet = (id: string, patch: Partial<Carpet>) =>
+    setCarpets((prev) =>
+      prev.map((c) => (c.id === id ? { ...c, ...patch } : c))
+    );
+
+  const handleCreate = (draft: CarpetDraft) => {
+    const carpet: Carpet = {
+      ...draft,
+      id: nextCarpetId(carpets),
+      archived: false,
+      createdAt: Date.now(),
+      marks: [],
+    };
+    setCarpets((prev) => [carpet, ...prev]);
+    setOrigin("全部");
+    setSelectedId(carpet.id);
+  };
+
+  /* ---------------- 标记操作（重开只动一个标记，其余已签保留） ---------------- */
+
+  const updateMark = (
+    carpetId: string,
+    markId: string,
+    fn: (mark: DamageMark) => DamageMark
+  ) =>
+    setCarpets((prev) =>
+      prev.map((c) =>
+        c.id !== carpetId
+          ? c
+          : { ...c, marks: c.marks.map((m) => (m.id === markId ? fn(m) : m)) }
+      )
+    );
+
+  const handleAddMark = (x: number, y: number) => {
+    if (!selected || selected.archived) return;
+    const mark = makeMark(x, y);
+    patchCarpet(selected.id, { marks: [...selected.marks, mark] });
+    setSelectedMarkId(mark.id);
+  };
+
+  const handleSign = (markId: string) =>
+    selected && updateMark(selected.id, markId, (m) => signMark(m));
+
+  const handleReopen = (markId: string) =>
+    selected && updateMark(selected.id, markId, (m) => reopenMark(m));
+
+  const handleDeleteMark = (markId: string) => {
+    if (!selected) return;
+    patchCarpet(selected.id, {
+      marks: selected.marks.filter((m) => m.id !== markId),
+    });
+    setSelectedMarkId(null);
+  };
+
+  /* ---------------- 修复前后记录 ---------------- */
+
+  const handleAddRecord = (
+    markId: string,
+    stage: RepairRecord["stage"]
+  ) => {
+    if (!selected) return;
+    const date = new Date().toISOString().slice(0, 10);
+    updateMark(selected.id, markId, (m) =>
+      addRecord(m, makeRecord(stage, date))
+    );
+  };
+
+  const handleChangeRecord = (
+    markId: string,
+    recordId: string,
+    patch: Partial<Omit<RepairRecord, "id">>
+  ) =>
+    selected &&
+    updateMark(selected.id, markId, (m) => updateRecord(m, recordId, patch));
+
+  const handleRemoveRecord = (markId: string, recordId: string) =>
+    selected &&
+    updateMark(selected.id, markId, (m) => removeRecord(m, recordId));
+
+  /* ---------------- 归档（标记齐签才可归档；可撤回后重开单个标记） ---------------- */
+
+  const handleArchive = () =>
+    selected && patchCarpet(selected.id, { archived: true });
+
+  const handleUnarchive = () =>
+    selected && patchCarpet(selected.id, { archived: false });
+
+  const selectCarpet = (id: string) => {
+    setSelectedId(id);
+    setSelectedMarkId(null);
+  };
+
   return (
     <main className="app">
-      <section className="hero">
-        <p>{project.id} · 源提示词{project.sourceNo} · Port {project.port}</p>
-        <h1>{project.title}</h1>
-        <span>{project.prompt}</span>
-      </section>
-
-      <section className="metrics">
-        {project.metrics.map((metric: string, index: number) => (
-          <article key={metric}>
-            <small>{metric}</small>
-            <strong>{[28, 6, 14, 91][index] ?? 10}</strong>
-          </article>
-        ))}
-      </section>
+      <Header saveError={saveError} />
+      <MetricsBar carpets={visibleCarpets} />
 
       <section className="workspace">
-        <aside className="panel">
-          <h2>{project.domain}分类</h2>
-          <div className="chips">
-            {project.filters.map((item: string) => (
-              <button key={item}>{item}</button>
-            ))}
-          </div>
-        </aside>
+        <Sidebar
+          allCarpets={visibleCarpets}
+          activeOrigin={origin}
+          selectedId={selectedId}
+          onSelectOrigin={setOrigin}
+          onSelectCarpet={selectCarpet}
+        />
+        <CarpetForm onCreate={handleCreate} />
+      </section>
 
-        <section className="panel form-panel">
-          <div className="heading">
-            <div>
-              <p>专业字段</p>
-              <h2>新增记录</h2>
-            </div>
-            <button className="primary">保存记录</button>
-          </div>
-          <div className="field-grid">
-            {project.fields.map((field: string) => (
-              <label key={field}>
-                <span>{field}</span>
-                <input placeholder={"填写" + field} />
-              </label>
-            ))}
-          </div>
+      {selected ? (
+        <Detail
+          key={selected.id}
+          carpet={selected}
+          selectedMarkId={selectedMarkId}
+          onSelectMark={setSelectedMarkId}
+          onAddMark={handleAddMark}
+          onPatchMark={(markId, patch) =>
+            updateMark(selected.id, markId, (m) => ({ ...m, ...patch }))
+          }
+          onSignMark={handleSign}
+          onReopenMark={handleReopen}
+          onDeleteMark={handleDeleteMark}
+          onAddRecord={handleAddRecord}
+          onChangeRecord={handleChangeRecord}
+          onRemoveRecord={handleRemoveRecord}
+          onPatchCarpet={(patch) => patchCarpet(selected.id, patch)}
+          onArchive={handleArchive}
+          onUnarchive={handleUnarchive}
+        />
+      ) : (
+        <section className="panel empty-state">
+          <p>左侧选择一块地毯，或先在“登记地毯”里入册，再在纹样图上标记破损。</p>
         </section>
-      </section>
+      )}
 
-      <section className="panel">
-        <div className="heading">
-          <div>
-            <p>近期记录</p>
-            <h2>工作台摘要</h2>
-          </div>
-          <button>导出CSV</button>
-        </div>
-        <div className="records">
-          {project.records.map((record: string[], index: number) => (
-            <article key={record.join("-")}>
-              <b>{String(index + 1).padStart(2, "0")}</b>
-              <div>
-                <h3>{record[0]}</h3>
-                <p>{record.slice(1).join(" · ")}</p>
-              </div>
-            </article>
-          ))}
-        </div>
-      </section>
+      <MaterialPanel carpets={visibleCarpets} scope={origin} />
     </main>
   );
 }
